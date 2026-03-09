@@ -1,0 +1,28 @@
+# Flink NetworkPolicy - 限制 Pod 通訊
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flink-netpol
+  namespace: flink-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: flink
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: flink-lab
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: minio
+      ports:
+        - port: 9000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kafka
+      ports:
+        - port: 9092

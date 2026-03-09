@@ -1,0 +1,23 @@
+# Maven
+target/
+*.jar
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Flink
+/tmp/flink-*
+*.log
+
+# Kind
+/tmp/flink-data/

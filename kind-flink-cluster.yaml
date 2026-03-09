@@ -1,0 +1,18 @@
+# Kind Cluster 設定 - Flink Lab 環境
+# 用法：kind create cluster --config kind-flink-cluster.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: flink-lab
+nodes:
+  - role: control-plane
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/flink-data
+        containerPath: /data
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/flink-data
+        containerPath: /data
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443

@@ -1,0 +1,16 @@
+# Prometheus ServiceMonitor - 抓取 Flink Metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flink-metrics
+  namespace: flink-lab
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: flink
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /

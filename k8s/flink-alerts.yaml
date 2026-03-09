@@ -1,0 +1,63 @@
+# Flink CDC 告警規則
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flink-cdc-alerts
+  namespace: flink-lab
+spec:
+  groups:
+    - name: flink.cdc.reliability
+      interval: 30s
+      rules:
+        # CDC 消費延遲超過 60 秒
+        - alert: FlinkCdcLagHigh
+          expr: |
+            flink_taskmanager_job_task_operator_currentFetchEventTimeLag > 60000
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flink CDC lag is high"
+            description: "CDC lag {{ $value }}ms exceeds 60s threshold"
+
+        # Checkpoint 失敗
+        - alert: FlinkCheckpointFailed
+          expr: |
+            increase(flink_jobmanager_job_numberOfFailedCheckpoints[5m]) > 3
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Flink Checkpoint repeatedly failing"
+            description: "{{ $value }} checkpoint failures in 5 minutes"
+
+        # 無資料接收（可能 CDC 斷線）
+        - alert: FlinkNoRecordsReceived
+          expr: |
+            rate(flink_taskmanager_job_task_numRecordsIn[5m]) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Flink CDC source stopped receiving records"
+
+        # DLQ 有積壓
+        - alert: FlinkDlqHasMessages
+          expr: |
+            kafka_consumer_group_lag{topic="flink.orders.dlq"} > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DLQ has unprocessed messages"
+            description: "DLQ lag: {{ $value }} messages"
+
+        # Backpressure 過高
+        - alert: FlinkBackpressureHigh
+          expr: |
+            flink_taskmanager_job_task_isBackPressured > 0.5
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flink task under high backpressure"

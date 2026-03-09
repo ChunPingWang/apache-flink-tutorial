@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+  <Appenders>
+    <Console name="Console" target="SYSTEM_OUT">
+      <JsonTemplateLayout>
+        <EventTemplateAdditionalField key="service" value="flink-cdc-demo"/>
+        <EventTemplateAdditionalField key="environment" value="${env:ENV:-local}"/>
+      </JsonTemplateLayout>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <Logger name="com.example.flink" level="INFO"/>
+    <Logger name="com.ververica.cdc" level="INFO"/>
+    <Logger name="org.apache.flink" level="WARN"/>
+    <Root level="WARN">
+      <AppenderRef ref="Console"/>
+    </Root>
+  </Loggers>
+</Configuration>

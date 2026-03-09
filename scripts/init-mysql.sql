@@ -1,0 +1,22 @@
+-- init-mysql.sql
+-- MySQL 測試資料初始化腳本
+
+-- 建立訂單資料表
+CREATE TABLE IF NOT EXISTS orders (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  status      VARCHAR(20) DEFAULT 'PENDING',
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 初始化測試資料
+INSERT INTO orders (customer_id, amount, status) VALUES
+  (1001, 5000.00, 'COMPLETED'),
+  (1002, 12000.50, 'PENDING'),
+  (1003, 3200.00, 'COMPLETED');
+
+-- 授予 Flink CDC 所需權限
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'flink'@'%';
+FLUSH PRIVILEGES;
