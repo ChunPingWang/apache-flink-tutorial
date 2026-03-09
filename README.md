@@ -46,11 +46,33 @@ Flink 概念   →   Kind 環境 + 第一個  →  CDC 可靠度 +       →  AW
 | 容器平台 | Kind &rarr; AWS Outposts EKS | K8s 執行環境 |
 | Flink 管理 | Flink Kubernetes Operator | Job 生命週期管理 |
 | CDC 來源 | Flink CDC (Debezium) | MySQL/PostgreSQL 變更擷取 |
-| 訊息佇列 | Apache Kafka | 事件緩衝與 DLQ |
+| 訊息佇列 | Apache Kafka | Dead Letter Queue (DLQ) |
 | 存儲 | MinIO (S3 相容) | Checkpoint / Savepoint |
 | 資料庫 | MySQL 8.0 | 來源 DB |
 | 監控 | Prometheus + Grafana | 指標可觀測 |
 | 語言 | Java 17 + Maven | Job 開發 |
+
+### Kafka 在本 PoC 的角色
+
+在本架構中，Kafka 的角色是 **Dead Letter Queue (DLQ)**，用於暫存處理失敗的事件。
+
+```
+MySQL CDC Source → 解析 → 業務驗證 ─┬─ 正常 → AuditLogSink (PostgreSQL)
+                                     │
+                                     └─ 異常 → DLQ (Kafka topic: flink.orders.dlq)
+```
+
+**觸發 DLQ 的情況：**
+1. **JSON 解析失敗** — `CdcEventParser` 無法解析 Debezium 事件
+2. **業務驗證失敗** — 例如金額為負數
+
+**DLQ 的價值：**
+- 失敗事件不會遺失，可供人工審查或自動補償
+- 搭配告警規則 `FlinkDlqHasMessages`，DLQ 有積壓時即時通知
+
+**重要區別：** Kafka 在此架構中 **不是** CDC 的傳輸層。CDC 事件由 Flink CDC Connector 直接從 MySQL Binlog 讀取，不經過 Kafka。這與常見的 `Debezium → Kafka → Flink` 架構不同。
+
+**簡化選項：** PoC 初期可先用 `print()` 或寫入檔案替代 Kafka DLQ，待環境穩定後再接上。`DlqSink.java` 中已提供 `System.out.println` 作為 fallback。
 
 ---
 
