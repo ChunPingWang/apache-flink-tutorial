@@ -1,4 +1,5 @@
-# MinIO 生產環境設定（StatefulSet）
+# MinIO 生產環境設定（4 節點分散式模式）
+# Erasure Coding: 可容忍最多 2 節點同時故障，資料不丟失
 apiVersion: v1
 kind: Secret
 metadata:
@@ -15,11 +16,12 @@ metadata:
   name: minio
   namespace: minio
 spec:
-  replicas: 1  # 生產環境建議 4 nodes 分散式模式
+  replicas: 4  # 4 節點分散式模式，Erasure Coding 保護
   selector:
     matchLabels:
       app: minio
-  serviceName: minio
+  serviceName: minio-headless
+  podManagementPolicy: Parallel
   template:
     metadata:
       labels:
@@ -30,7 +32,8 @@ spec:
           image: quay.io/minio/minio:RELEASE.2024-03-15
           args:
             - server
-            - /data
+            # 分散式模式：指定所有節點端點
+            - http://minio-{0...3}.minio-headless.minio.svc.cluster.local/data
             - --console-address
             - ":9001"
           env:
@@ -57,11 +60,20 @@ spec:
               path: /minio/health/live
               port: 9000
             initialDelaySeconds: 30
+            periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /minio/health/ready
               port: 9000
             initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -71,6 +83,21 @@ spec:
           requests:
             storage: 100Gi
 ---
+# Headless Service（StatefulSet 節點發現用）
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-headless
+  namespace: minio
+spec:
+  clusterIP: None
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      name: api
+---
+# ClusterIP Service（應用程式存取用）
 apiVersion: v1
 kind: Service
 metadata:

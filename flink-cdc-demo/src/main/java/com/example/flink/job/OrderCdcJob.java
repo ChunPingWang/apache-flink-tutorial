@@ -4,6 +4,7 @@ import com.example.flink.model.AuditLog;
 import com.example.flink.model.OrderEvent;
 import com.example.flink.sink.AuditLogSink;
 import com.example.flink.sink.DlqSink;
+import com.example.flink.util.CheckpointManager;
 import com.example.flink.util.JsonUtil;
 import com.ververica.cdc.connectors.mysql.source.MySqlSource;
 import com.ververica.cdc.connectors.mysql.table.StartupOptions;
@@ -11,9 +12,7 @@ import com.ververica.cdc.debezium.JsonDebeziumDeserializationSchema;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.time.Time;
-import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -68,11 +67,11 @@ public class OrderCdcJob {
             .addSink(new AuditLogSink())
             .name("Audit Log Sink");
 
-        // 6. DLQ：失敗事件寫入 Kafka
+        // 6. DLQ：失敗事件寫入 Kafka（使用新版 Sink API）
         processedStream
             .getSideOutput(DLQ_TAG)
             .map(event -> toAuditLog(event, "FAILED"))
-            .addSink(new DlqSink(getEnv("KAFKA_BROKERS", "flink-kafka-kafka-brokers.kafka:9092")))
+            .sinkTo(DlqSink.build(getEnv("KAFKA_BROKERS", "flink-kafka-kafka-brokers.kafka:9092")))
             .name("DLQ Kafka Sink");
 
         env.execute("Order CDC Pipeline");
@@ -82,24 +81,16 @@ public class OrderCdcJob {
     private static StreamExecutionEnvironment buildEnvironment() {
         Configuration config = new Configuration();
 
-        // Checkpoint 設定
-        config.set(CheckpointingOptions.CHECKPOINTING_INTERVAL,
-            java.time.Duration.ofSeconds(30));
-        config.set(CheckpointingOptions.CHECKPOINTING_MODE,
-            CheckpointingMode.EXACTLY_ONCE);
-        config.set(CheckpointingOptions.CHECKPOINT_STORAGE,
-            "filesystem");
-        config.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY,
-            getEnv("CHECKPOINT_DIR", "s3a://flink-checkpoints/order-cdc"));
-        config.set(CheckpointingOptions.MAX_RETAINED_CHECKPOINTS, 5);
-        config.set(CheckpointingOptions.TOLERABLE_FAILURE_NUMBER, 3);
-
         // State Backend
         config.setString("state.backend", "rocksdb");
         config.setBoolean("state.backend.incremental", true);
 
         StreamExecutionEnvironment env =
             StreamExecutionEnvironment.getExecutionEnvironment(config);
+
+        // Checkpoint 設定（使用 CheckpointManager 統一管理）
+        String s3BasePath = getEnv("CHECKPOINT_DIR", "s3a://flink-checkpoints/order-cdc");
+        CheckpointManager.configureProduction(env, s3BasePath);
 
         // 重啟策略：指數退避，最多 10 次
         env.setRestartStrategy(
