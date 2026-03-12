@@ -11,6 +11,7 @@
 
 - [課程總覽](#課程總覽)
 - [技術棧](#技術棧)
+- [可靠度設計總覽（Reliability by Design）](#可靠度設計總覽reliability-by-design)
 - [專案結構](#專案結構)
 - [Module 1：Flink 基礎概念](#module-1flink-基礎概念)
 - [Module 2：本地環境建置 (Kind)](#module-2本地環境建置-kind)
@@ -73,6 +74,170 @@ MySQL CDC Source → 解析 → 業務驗證 ─┬─ 正常 → AuditLogSink (
 **重要區別：** Kafka 在此架構中 **不是** CDC 的傳輸層。CDC 事件由 Flink CDC Connector 直接從 MySQL Binlog 讀取，不經過 Kafka。這與常見的 `Debezium → Kafka → Flink` 架構不同。
 
 **簡化選項：** PoC 初期可先用 `print()` 或寫入檔案替代 Kafka DLQ，待環境穩定後再接上。`DlqSink.java` 中已提供 `System.out.println` 作為 fallback。
+
+---
+
+## 可靠度設計總覽（Reliability by Design）
+
+本專案從架構層面實現端到端資料可靠性，以下為四大核心機制及其優先級：
+
+| 優先級 | 機制 | 目的 | 實作位置 |
+|--------|------|------|----------|
+| **P0** | 啟用 Checkpointing | 故障恢復、資料不遺失 | `CheckpointManager.java` |
+| **P0** | 冪等 Sink (ON CONFLICT) | 防止重複資料 | `AuditLogSink.java` |
+| **P1** | DLQ 機制 | 失敗資料可追蹤重處理 | `DlqSink.java` + `OrderCdcJob.java` |
+| **P1** | 指數退避重啟策略 | 持續故障時更具韌性 | `OrderCdcJob.java` |
+
+### P0 — 啟用 Checkpointing
+
+Checkpoint 是 Flink 故障恢復的基石。當 Job 異常崩潰時，Flink 會從最近一次成功的 Checkpoint 恢復所有 Operator 狀態與 Source offset（Binlog position），確保資料不遺失。
+
+**實作方式**（`CheckpointManager.configureProduction()`）：
+
+```java
+// 每 30 秒觸發一次 Checkpoint，使用 EXACTLY_ONCE 語義
+env.enableCheckpointing(30_000, CheckpointingMode.EXACTLY_ONCE);
+
+env.getCheckpointConfig()
+    .setCheckpointTimeout(10 * 60 * 1000)          // 逾時 10 分鐘
+    .setMinPauseBetweenCheckpoints(5_000)           // 兩次 Checkpoint 最小間隔 5 秒
+    .setMaxConcurrentCheckpoints(1)                 // 同時最多 1 個 Checkpoint
+    .setTolerableCheckpointFailureNumber(3)         // 允許連續失敗 3 次
+    .setExternalizedCheckpointCleanup(              // Job 取消時保留 Checkpoint
+        RETAIN_ON_CANCELLATION);
+
+// 搭配 RocksDB 增量 Checkpoint + S3/MinIO 持久化存儲
+env.getCheckpointConfig().setCheckpointStorage(s3BasePath + "/checkpoints");
+```
+
+**故障恢復流程**：
+
+```
+Job 崩潰 → Flink 偵測到 TaskManager 失聯
+         → 從最近成功的 Checkpoint 讀取 State 快照
+         → 將 CDC Source offset 回溯到 Checkpoint 記錄的 Binlog position
+         → 重新部署 Task 並從該 offset 重播事件
+         → 搭配冪等 Sink → 重播不會產生重複資料
+```
+
+### P0 — 冪等 Sink（ON CONFLICT）
+
+Checkpoint 恢復時會重播部分已處理過的事件。若 Sink 不具備冪等性，將導致資料重複。本專案透過 PostgreSQL 的 `ON CONFLICT` 語法，以 `(binlog_file, binlog_pos)` 為唯一鍵，保證同一筆 CDC 事件無論寫入幾次，結果都相同。
+
+**實作方式**（`AuditLogSink.java`）：
+
+```sql
+INSERT INTO cdc_audit_log
+  (source_table, operation, binlog_file, binlog_pos, gtid,
+   captured_at, processed_at, status, payload_after, job_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?)
+ON CONFLICT (binlog_file, binlog_pos)
+DO UPDATE SET
+  processed_at = EXCLUDED.processed_at,
+  status       = EXCLUDED.status
+```
+
+**為什麼用 `(binlog_file, binlog_pos)` 做唯一鍵**：每筆 CDC 事件在 MySQL Binlog 中有唯一的 `(file, position)` 組合，這是天然的冪等鍵。即使 Flink 重播相同事件，SQL 只會更新 `processed_at` 和 `status`，不會產生新的重複行。
+
+### P1 — DLQ（Dead Letter Queue）機制
+
+無法正確處理的事件不應被丟棄或阻塞主流程。本專案透過 Flink Side Output 將失敗事件分流至 Kafka DLQ topic，確保這些事件可被追蹤、稽核、並在修復後重新處理。
+
+**觸發 DLQ 的場景**：
+
+| 場景 | 觸發位置 | 範例 |
+|------|----------|------|
+| JSON 解析失敗 | `CdcEventParser` | Debezium 事件格式異常 |
+| 業務驗證失敗 | `OrderProcessor` | 訂單金額為負數 |
+
+**實作方式**（`OrderCdcJob.java` + `DlqSink.java`）：
+
+```java
+// 1. 定義 Side Output Tag
+static final OutputTag<OrderEvent> DLQ_TAG = new OutputTag<OrderEvent>("dlq") {};
+
+// 2. 在 ProcessFunction 中將異常事件導向 DLQ
+if (amount < 0) {
+    ctx.output(DLQ_TAG, event);  // 分流至 DLQ
+} else {
+    out.collect(event);          // 正常流程
+}
+
+// 3. 收集 Side Output 並寫入 Kafka DLQ Topic
+processedStream.getSideOutput(DLQ_TAG)
+    .map(event -> toAuditLog(event, "FAILED"))
+    .sinkTo(DlqSink.build(kafkaBrokers));  // 寫入 Kafka topic: flink.orders.dlq
+```
+
+**DLQ Sink 同樣使用 `EXACTLY_ONCE` 事務保證**，搭配 Kafka 事務（`transactional.id.prefix = dlq-sink`），確保 DLQ 事件也不會在 Checkpoint 恢復時重複寫入。
+
+**後續處理**：DLQ 中的事件可透過告警規則 `FlinkDlqHasMessages` 觸發通知，由人工審查或自動補償程式重新處理。
+
+### P1 — 指數退避重啟策略
+
+當 Job 因暫時性故障（如網路抖動、資料庫連線中斷）而失敗時，Flink 會自動重啟。指數退避策略避免了固定間隔重啟在持續故障場景下的「重啟風暴」，讓系統有時間恢復。
+
+**實作方式**（`OrderCdcJob.buildEnvironment()`）：
+
+```java
+env.setRestartStrategy(
+    RestartStrategies.exponentialDelayRestart(
+        Time.seconds(1),     // 初始延遲：1 秒
+        Time.minutes(5),     // 最大延遲：5 分鐘
+        2.0,                 // 退避倍數：每次加倍
+        Time.minutes(10),    // 重置窗口：穩定運行 10 分鐘後重置計數
+        0.1                  // 抖動因子：±10% 隨機偏移，避免多 Job 同時重啟
+    )
+);
+```
+
+**重啟行為示意**：
+
+```
+第 1 次失敗 → 等待 ~1 秒後重啟
+第 2 次失敗 → 等待 ~2 秒後重啟
+第 3 次失敗 → 等待 ~4 秒後重啟
+第 4 次失敗 → 等待 ~8 秒後重啟
+  ...
+第 N 次失敗 → 等待最多 5 分鐘後重啟
+（穩定運行超過 10 分鐘後，延遲計數重置為 1 秒）
+```
+
+**與固定間隔重啟的對比**：
+
+| 策略 | 暫時性故障 | 持續性故障 | 資源消耗 |
+|------|-----------|-----------|---------|
+| 固定間隔 (`fixedDelayRestart`) | 快速恢復 | 持續消耗資源反覆重啟 | 高 |
+| **指數退避** (`exponentialDelayRestart`) | 快速恢復（初始 1s） | 逐步拉長間隔，減少無效重啟 | **低** |
+
+### 四大機制協同運作
+
+```
+MySQL Binlog 事件
+       │
+       ▼
+  CDC Source（記錄 offset）
+       │
+       ▼
+  ┌─ Checkpoint ──────────────────────────────────────────────┐
+  │  每 30 秒快照：Source offset + 所有 Operator State        │
+  │  故障時從快照恢復 → 保證 P0：資料不遺失                     │
+  └───────────────────────────────────────────────────────────┘
+       │
+       ▼
+  解析 & 業務處理
+       │
+  ┌────┴────┐
+  │ 正常     │ 異常
+  ▼         ▼
+Audit Log  DLQ (Kafka)
+ON CONFLICT  EXACTLY_ONCE 事務
+  │           │
+  │           └─→ P1：失敗事件可追蹤重處理
+  └─────────────→ P0：冪等寫入，重播不重複
+
+整個 Job 由指數退避重啟策略保護 → P1：持續故障時更具韌性
+```
 
 ---
 
